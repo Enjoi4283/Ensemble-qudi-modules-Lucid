@@ -82,10 +82,37 @@ class MicrowaveTabor(MicrowaveInterface):
     def on_activate(self):
         """ Initialisation performed during activation of the module."""
         # Connect to hardware
-        self._device = hid.HidDeviceFilter(
-            vendor_id = self.teVendorId, 
-            product_id = self.teLucidPortableId
-            ).get_devices()[0]
+        # Try every known Lucid product ID, so any of the three model
+        # variants can be plugged in without editing this file or the config.
+        # The upstream code filtered on teLucidPortableId only, silently
+        # ignoring the Desktop and Benchtop entries in the config.
+        device_ids = []
+        for candidate in (self.teLucidDesktopId,
+                          self.teLucidPortableId,
+                          self.teLucidBenchtopId):
+            try:
+                value = int(candidate)
+            except (TypeError, ValueError):
+                continue
+            if value not in device_ids:
+                device_ids.append(value)
+
+        devices = []
+        for pid in device_ids:
+            found = hid.HidDeviceFilter(
+                vendor_id=self.teVendorId,
+                product_id=pid
+            ).get_devices()
+            devices.extend(found)
+
+        if not devices:
+            raise RuntimeError(
+                'No Tabor Lucid device found on USB. Searched vendor 0x{:04X} '
+                'with product IDs {}.'.format(
+                    self.teVendorId,
+                    ', '.join('0x{:04X}'.format(p) for p in device_ids))
+            )
+        self._device = devices[0]
         
         # Open device
         # self._device.open() not necessary in usb mode
