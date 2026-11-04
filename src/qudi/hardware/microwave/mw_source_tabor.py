@@ -56,6 +56,7 @@ class MicrowaveTabor(MicrowaveInterface):
     channel = ConfigOption('channel', default= 1)
     BUFFER_SIZE = ConfigOption('BUFFER_SIZE', default = 256)
     _rising_edge_trigger = ConfigOption('rising_edge_trigger', default=True)
+    _advance_mode = ConfigOption('advance_mode', default='AUTO')
     _config_freq_min = ConfigOption('frequency_min', default=None)
     _config_freq_max = ConfigOption('frequency_max', default=None)
     _config_power_min = ConfigOption('power_min', default=None)
@@ -83,7 +84,7 @@ class MicrowaveTabor(MicrowaveInterface):
         # Connect to hardware
         self._device = hid.HidDeviceFilter(
             vendor_id = self.teVendorId, 
-            product_id = self.teLucidBenchtopId
+            product_id = self.teLucidPortableId
             ).get_devices()[0]
         
         # Open device
@@ -103,8 +104,10 @@ class MicrowaveTabor(MicrowaveInterface):
         
         # Generate constraints
         # self._model == 'LS3082B':
-        freq_limits = (1e8, 3e9) # real range should be (9e3, 12e9)
-                                  # but this is for this hard to achieve, stupid
+        # Lucid family limits. The original (1e8, 3e9) was a workaround; the
+        # hardware floor is 9 kHz and the ceiling depends on the model, so set
+        # the per-model values from config and let these act as fallbacks.
+        freq_limits = (9e3, 12e9)
         power_limits = (-100, 20)
 
         # Apply configured soft-boundaries
@@ -114,18 +117,24 @@ class MicrowaveTabor(MicrowaveInterface):
         if self._config_power_max is not None:
             assert self._config_power_max > power_limits[0]
             power_limits = (power_limits[0], min(power_limits[1], self._config_power_max))
+        # Config values define the range directly. The original code used
+        # max()/min() which meant a configured minimum below the hardcoded
+        # floor could never take effect.
         if self._config_freq_min is not None:
-            assert self._config_freq_min < freq_limits[1]
-            freq_limits = (max(freq_limits[0], self._config_freq_min), freq_limits[1])
+            freq_limits = (float(self._config_freq_min), freq_limits[1])
         if self._config_freq_max is not None:
-            assert self._config_freq_max > freq_limits[0]
-            freq_limits = (freq_limits[0], min(freq_limits[1], self._config_freq_max))
+            freq_limits = (freq_limits[0], float(self._config_freq_max))
+        assert freq_limits[0] < freq_limits[1], \
+            'frequency_min must be below frequency_max'
         self._constraints = MicrowaveConstraints(
             power_limits=power_limits,
             frequency_limits=freq_limits,           
             scan_size_limits=(2, 4096),
-            sample_rate_limits=(0.1, 100), 
-            # sample_rate_limits=(100e-6, 4295), wirrten in document !!!!
+            # Upper bound is the hardware dwell floor of 100 us, i.e. 10 kHz.
+            # The Lucid manual gives the same 100 us floor for :LIST:DEF and
+            # :FRSW:TIME. The original cap of 100 Hz throttled the instrument
+            # by two orders of magnitude.
+            sample_rate_limits=(0.1, 10000),
             scan_modes=(SamplingOutputMode.JUMP_LIST, SamplingOutputMode.EQUIDISTANT_SWEEP)
         )
 
@@ -244,6 +253,17 @@ class MicrowaveTabor(MicrowaveInterface):
     def configure_scan(self, power, frequencies, mode, sample_rate):
         """
         """
+        # Accept the mode as a string as well as the enum. Remote clients
+        # (the qudi console over rpyc) cannot pass the driver's own enum
+        # object, so a name is the only practical way to select a mode there.
+        if isinstance(mode, str):
+            try:
+                mode = SamplingOutputMode[mode.upper()]
+            except KeyError:
+                raise ValueError(
+                    'Unknown scan mode {!r}. Valid names: {}'.format(
+                        mode, ', '.join(m.name for m in SamplingOutputMode))
+                )
         with self._thread_lock:
             # Sanity checks
             if self.module_state() != 'idle':
@@ -269,16 +289,18 @@ class MicrowaveTabor(MicrowaveInterface):
         Must return AFTER the device has actually stopped.
         """
         with self._thread_lock:
+            # Always send the command. The module state can disagree with the
+            # hardware (it is only updated by this class, and list/sweep state
+            # queries are unreliable on this firmware), so trusting
+            # module_state() here left the RF running on a no-op.
+            self._command_wait(':OUTP OFF')
+            if self._list_state:
+                self._command_wait(':LIST OFF')
+                self._list_state = 0
+            self._command_wait(':FRSW OFF')
+            time.sleep(0.3)
+            self._wait_output_state(expected=False)
             if self.module_state() != 'idle':
-                list_mode = self._in_list_mode() or self._in_sweep_mode
-                self._command_wait(':OUTP OFF')
-                if list_mode:
-                    self._command_wait(':LIST OFF')
-                    self._list_state = 0
-                    self._command_wait(':FRSW OFF')
-                time.sleep(0.3)
-                while self._command_wait(':OUTP?') == 'ON':
-                    time.sleep(0.2)
                 self.module_state.unlock()
 
     def cw_on(self):
@@ -303,8 +325,7 @@ class MicrowaveTabor(MicrowaveInterface):
 
             self._command_wait(':OUTP ON')
             time.sleep(0.3)
-            while self._command_wait(':OUTP?') != 'ON':
-                time.sleep(0.2)
+            self._wait_output_state(expected=True)
             self.module_state.lock()
 
     def start_scan(self):
@@ -323,20 +344,17 @@ class MicrowaveTabor(MicrowaveInterface):
             # LIST mode
             if self._scan_mode == SamplingOutputMode.JUMP_LIST:
                 if not self._in_list_mode():
-                    # self._write_list()
-                    self._write_sweep()
+                    self._write_list()
                                    
                 self._command_wait(':OUTP ON')
-                while self._command_wait(':OUTP?') != 'ON':
-                    time.sleep(0.2)
+                self._wait_output_state(expected=True)
             # SWEEP mode
             elif self._scan_mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
                 if not self._in_sweep_mode():
                     self._write_sweep()
 
                 self._command_wait(':OUTP ON')
-                while self._command_wait(':OUTP?') != 'ON':
-                    time.sleep(0.2)
+                self._wait_output_state(expected=True)
             else:
                 raise RuntimeError(
                     f'Invalid scan mode encountered ({self._scan_mode}). Please set scan_mode '
@@ -391,25 +409,55 @@ class MicrowaveTabor(MicrowaveInterface):
         @param str command_str: The command to be written
         """
         if not self._device:
-            print ("No device provided")
+            print("No device provided")
             return
-        
-        self._device.open()
-        buffer=[0x00] * self.BUFFER_SIZE # USB packet size
+
+        self._temp_read = None
+        buffer = [0x00] * self.BUFFER_SIZE
         sendData = bytearray(command_str, 'utf-8')
-        sendData_len = len(command_str)
+        for i in range(len(sendData)):
+            buffer[i + 3] = sendData[i]
 
-        for  i in range(sendData_len):
-            buffer[i+3] = sendData[i]
-
-        self._device.send_output_report(buffer)
-        time.sleep(0.3)
+        self._device.open()
         self._device.set_raw_data_handler(self.readData)
+        self._device.send_output_report(buffer)
+
+        for _ in range(75):
+            if self._temp_read is not None:
+                break
+            time.sleep(0.02)
         self._device.close()
 
-        return self._temp_read
+        response = self._temp_read
+        if response is not None and 'SCPI ERROR' in response.upper():
+            raise RuntimeError(
+                'Instrument rejected command {!r}: {}'.format(
+                    command_str.strip(), response.strip())
+            )
+        return response
     
     
+    def _wait_output_state(self, expected, attempts=10, interval=0.2):
+        """Wait for the output relay to reach `expected`, but never block forever.
+
+        The firmware will not always answer ':OUTP?' (and does not report
+        errors over HID), so the original unbounded while-loops could spin
+        indefinitely while holding the module thread lock. This gives up after
+        a bounded number of reads and logs instead of hanging.
+        """
+        for _ in range(attempts):
+            time.sleep(interval)
+            state = self._command_wait(':OUTP?')
+            if state is None:
+                continue
+            if (state.strip() == 'ON') == expected:
+                return True
+        self.log.warning(
+            'Output state did not read back as {} after {} attempts. '
+            'Proceeding anyway.'.format('ON' if expected else 'OFF', attempts)
+        )
+        return False
+
     def _in_list_mode(self):
         return self._list_state == 1
 
@@ -420,52 +468,104 @@ class MicrowaveTabor(MicrowaveInterface):
         return not (self._in_list_mode() or self._in_sweep_mode())
 
     def _write_list(self):
+        """Download a frequency list to the instrument.
+
+        Syntax verified on an LS6081P (firmware 07CCE000), not taken from the
+        Lucid Programming Manual Rev. 1.1, which is wrong in three ways:
+
+          * It shows spaces after the commas in :LIST:DEF. The firmware
+            rejects that with "Invalid point"; the compact form is required.
+          * It documents <step> as 2..4096 but its own example uses step 1.
+            The firmware enforces the range: step 1 yields "Invalid point".
+          * It documents :LIST? as returning 1/0 by state. It always returns
+            OFF on this firmware, so list state is tracked in software.
+
+        <advance> 0 = auto-advance, 1 = triggered. <dwell> is in SECONDS.
+        """
         if not self._in_list_mode():
-            self._command_wait(':FRSW OFF') 
+            self._command_wait(':FRSW OFF')
             self._command_wait(':LIST ON')
             self._list_state = 1
-        self._command_wait('LIST:DELete:ALL') # previous list deleted
-        time.sleep(0.3)
+            time.sleep(0.3)
 
-        # set list parameters
-        self._command_wait('POWer {}\n'.format(self._scan_power))
-        temp_len = len(self._scan_frequencies)
-        end_symbol = 0
-        for i in range(temp_len):
-            if i == temp_len - 1:
-                end_symbol = 1
+        dwell = 1.0 / float(self._scan_sample_rate) if self._scan_sample_rate else 1e-3
+        if dwell < 100e-6:
+            dwell = 100e-6
+
+        self._command_wait(':POWer {}'.format(self._scan_power))
+
+        triggered = str(self._advance_mode).upper().startswith('TRIG')
+        advance = 1 if triggered else 0
+
+        # Step 1 is implicit and cannot be defined on this firmware, so the
+        # first frequency goes on step 2.
+        count = len(self._scan_frequencies)
+        for index in range(count):
+            last = 1 if index == count - 1 else 0
             self._command_wait(
-                'LIST:DEFine {},{},{},{},{},{}'.format(
-                    i + 1,
-                    self._scan_frequencies[i],
+                ':LIST:DEF {},{},{},{},{},{}'.format(
+                    index + 2,
+                    int(self._scan_frequencies[index]),
                     self._scan_power,
-                    end_symbol,
-                    0,
-                    self._scan_sample_rate
+                    last,
+                    advance,
+                    dwell
                 )
             )
-        self._command_wait(':INIT:CONT OFF')  # running with trigger
-        self._command_wait(':TRIG:ADV STEP')  # running with trigger 
+
+        if triggered:
+            # Each step waits for an external trigger on the rear TRIG input.
+            self._set_trigger_edge()
+            self._command_wait(':TRIG:SOUR EXTernal')
+            self._command_wait(':INIT:CONT OFF')
+            self._command_wait(':TRIG:ADV STEP')
+        else:
+            # Auto-advance needs continuous initiation; with :INIT:CONT OFF
+            # the unit sits on the first entry waiting for a trigger that
+            # never comes.
+            self._command_wait(':INIT:CONT ON')
 
     def _write_sweep(self):
-        if not self._in_sweep_mode():
+        """Configure and arm a frequency sweep.
+
+        Bench-verified on an LS6081P (firmware 07CCE000). Sweep mode requires
+        TRIGGERED run mode with the timer as trigger source, which is the
+        opposite of list mode: in continuous run mode the sweep accepts every
+        command, reports ':FRSW?' as ON, and never moves.
+
+        The engine interpolates into discrete points and steps between them;
+        there is no analog ramp. Use a fine :FRSW:STEP with a short
+        :FRSW:TIME for a sweep that looks continuous.
+
+        :TRIG:ADV ONC is required for one trigger to run a whole sweep.
+        ':TRIG:ADV ONCE' and ':TRIG:ADV 1' are accepted silently and ignored.
+        """
+        if self._in_list_mode():
             self._command_wait(':LIST OFF')
             self._list_state = 0
-            self._command_wait(':FRSW ON')
 
-        # start, stop, points = self._scan_frequencies
-        # step = (stop - start) / (points - 1) 
-        start, stop, step = self._scan_frequencies[0], self._scan_frequencies[-1], len(self._scan_frequencies) + 1
-        # is this input also suitable for Tabor ???
-        self._command_wait('POWer {}\n'.format(self._scan_power))
-        self._command_wait(':FRSW:STAR {}\n '.format(start))
-        self._command_wait(':FRSW:STEPs {}'.format(step))
-        self._command_wait(':FRSW:STOP {}\n '.format(stop))
-        # self._command_wait(':FRSW:TIME {}\n'.format(self._scan_sample_rate)) 
-        self._command_wait(':FRSW:DIR NORMal') # set the direction
-        time.sleep(0.3)
-        self._command_wait(':INIT:CONT OFF')  # running with trigger
-        self._command_wait(':TRIG:ADV STEP')  # running with trigger 
+        sweep = self._scan_frequencies
+        if isinstance(sweep, tuple) and len(sweep) == 3:
+            start, stop, steps = float(sweep[0]), float(sweep[1]), int(sweep[2])
+        else:
+            points = np.asarray(sweep, dtype=np.float64)
+            start, stop, steps = float(points[0]), float(points[-1]), len(points)
+
+        dwell = 1.0 / float(self._scan_sample_rate) if self._scan_sample_rate else 1e-3
+        if dwell < 100e-6:
+            dwell = 100e-6
+
+        self._command_wait(':TRIG:SOUR 2')      # timer
+        self._command_wait(':INIT:CONT OFF')    # triggered run mode
+        self._command_wait(':TRIG:ADV ONC')     # one trigger = whole sweep
+
+        self._command_wait(':POWer {}'.format(self._scan_power))
+        self._command_wait(':FRSW:STAR {}'.format(int(start)))
+        self._command_wait(':FRSW:STOP {}'.format(int(stop)))
+        self._command_wait(':FRSW:STEP {}'.format(steps))
+        self._command_wait(':FRSW:TIME {}'.format(dwell))
+        self._command_wait(':FRSW:DIR NORM')
+        self._command_wait(':FRSW ON')
 
     def _set_trigger_edge(self):
         edge = 'POS' if self._rising_edge_trigger else 'NEG'
